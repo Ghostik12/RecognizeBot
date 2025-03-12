@@ -1,14 +1,13 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
-using Telegram.Bot.Types;
+﻿using Telegram.Bot.Types;
 using Telegram.Bot;
 using iText.Kernel.Pdf.Canvas.Parser;
 using iText.Kernel.Pdf;
 using System.Text.RegularExpressions;
 using System.Globalization;
+using NPOI.SS.UserModel;
+using NPOI.HSSF.UserModel;
+using NPOI.XSSF.UserModel;
+using Telegram.Bot.Types.ReplyMarkups;
 
 namespace BotRecognize.Controller
 {
@@ -24,19 +23,31 @@ namespace BotRecognize.Controller
         {
             var user = update.Message.From.Id; // Ответственный за оплату счёта
 
-            if (update.Message.Document.MimeType == "application/pdf")
+            if (update.Message.Document != null)
             {
                 var file = await _client.GetFileAsync(update.Message.Document.FileId);
                 var filePath = $"{update.Message.Document.FileName}";
 
                 // Скачиваем файл
-                using (var saveStream = System.IO.File.Open(filePath, System.IO.FileMode.Create))
+                using (var saveStream = File.Open(filePath, FileMode.Create))
                 {
                     await _client.DownloadFile(file.FilePath, saveStream);
                 }
 
-                // Извлекаем текст из PDF
-                var text = ExtractTextFromPdf(filePath);
+                string text = "";
+
+                // Обработка PDF
+                if (update.Message.Document.MimeType == "application/pdf")
+                {
+                    text = ExtractTextFromPdf(filePath);
+                }
+                // Обработка Excel
+                else if (update.Message.Document.MimeType == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" ||
+                         update.Message.Document.MimeType == "application/vnd.ms-excel")
+                {
+                    text = ExtractTextFromExcel(filePath);
+                }
+
                 Console.WriteLine(text);
 
                 // Распознаем данные
@@ -51,7 +62,163 @@ namespace BotRecognize.Controller
 
                 // Отправляем ответ пользователю
                 await _client.SendTextMessageAsync(update.Message.Chat.Id, response);
+
+                // Удаляем временный файл
+                File.Delete(filePath);
             }
+        }
+
+        private static async Task HandleEditRequest(ITelegramBotClient client, long chatId, string response, (string InvoiceNumber, DateTime InvoiceDate, decimal Amount, string Recipient, string Purpose) data)
+        {
+            // Отправляем распознанные данные
+            await client.SendTextMessageAsync(chatId, response);
+
+            // Предлагаем редактирование
+            var keyboard = new ReplyKeyboardMarkup(new[]
+            {
+                new KeyboardButton("Да"),
+                new KeyboardButton("Нет")
+            })
+            {
+                ResizeKeyboard = true,
+                OneTimeKeyboard = true
+            };
+
+            await client.SendTextMessageAsync(chatId, "Хотите отредактировать данные?", replyMarkup: keyboard);
+
+            // Ожидаем ответа пользователя
+            var editResponse = await WaitForUserResponse(client, chatId);
+
+            if (editResponse == "Да")
+            {
+                // Предлагаем выбрать поле для редактирования
+                var fieldsKeyboard = new ReplyKeyboardMarkup(new[]
+                {
+                    new KeyboardButton("Номер счета"),
+                    new KeyboardButton("Дата"),
+                    new KeyboardButton("Сумма"),
+                    new KeyboardButton("Получатель"),
+                    new KeyboardButton("Назначение платежа")
+                })
+                {
+                    ResizeKeyboard = true,
+                    OneTimeKeyboard = true
+                };
+
+                await client.SendTextMessageAsync(chatId, "Что вы хотите отредактировать?", replyMarkup: fieldsKeyboard);
+
+                // Ожидаем выбора поля
+                var fieldToEdit = await WaitForUserResponse(client, chatId);
+
+                // Запрашиваем новое значение
+                await client.SendTextMessageAsync(chatId, $"Введите новое значение для {fieldToEdit}:", replyMarkup: new ReplyKeyboardRemove());
+
+                var newValue = await WaitForUserResponse(client, chatId);
+
+                // Обновляем данные
+                switch (fieldToEdit)
+                {
+                    case "Номер счета":
+                        data.InvoiceNumber = newValue;
+                        break;
+                    case "Дата":
+                        if (DateTime.TryParse(newValue, out var newDate))
+                        {
+                            data.InvoiceDate = newDate;
+                        }
+                        break;
+                    case "Сумма":
+                        if (decimal.TryParse(newValue, out var newAmount))
+                        {
+                            data.Amount = newAmount;
+                        }
+                        break;
+                    case "Получатель":
+                        data.Recipient = newValue;
+                        break;
+                    case "Назначение платежа":
+                        data.Purpose = newValue;
+                        break;
+                }
+
+                // Отправляем обновленные данные
+                var updatedResponse = $"Номер счета: {data.InvoiceNumber}\n" +
+                                      $"Дата: {data.InvoiceDate.ToShortDateString()}\n" +
+                                      $"Сумма: {data.Amount}\n" +
+                                      $"Получатель: {data.Recipient}\n" +
+                                      $"Назначение платежа: {data.Purpose}";
+
+                await client.SendTextMessageAsync(chatId, updatedResponse);
+
+                // Снова предлагаем редактирование
+                await HandleEditRequest(client, chatId, updatedResponse, data);
+            }
+            else
+            {
+                // Переходим к выбору проекта
+                await HandleProjectSelection(client, chatId, data);
+            }
+        }
+
+        private static async Task<string> WaitForUserResponse(ITelegramBotClient client, long chatId)
+        {
+            var tcs = new TaskCompletionSource<string>();
+            EventHandler<Update> handler = null;
+
+            handler = async (s, e) =>
+            {
+                if (e.Message.Chat.Id == chatId)
+                {
+                    tcs.SetResult(e.Message.Text);
+                    client.OnUpdate -= handler;
+                }
+            };
+
+            client.OnUpdate += handler;
+            return await tcs.Task;
+        }
+
+        private static string ExtractTextFromExcel(string filePath)
+        {
+            var text = new System.Text.StringBuilder();
+            IWorkbook workbook;
+
+            using (var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read))
+            {
+                // Определяем формат файла (XLS или XLSX)
+                if (Path.GetExtension(filePath).Equals(".xls", StringComparison.OrdinalIgnoreCase))
+                {
+                    workbook = new HSSFWorkbook(stream); // Для XLS
+                }
+                else
+                {
+                    workbook = new XSSFWorkbook(stream); // Для XLSX
+                }
+
+                // Чтение данных из всех листов
+                for (int i = 0; i < workbook.NumberOfSheets; i++)
+                {
+                    var sheet = workbook.GetSheetAt(i);
+                    for (int row = 0; row <= sheet.LastRowNum; row++)
+                    {
+                        var currentRow = sheet.GetRow(row);
+                        if (currentRow != null)
+                        {
+                            for (int col = 0; col < currentRow.LastCellNum; col++)
+                            {
+                                var cell = currentRow.GetCell(col);
+                                if (cell != null)
+                                {
+                                    text.Append(cell.ToString()).Append(" ");
+                                }
+                            }
+                            text.AppendLine();
+                        }
+                    }
+                }
+            }
+
+            return text.ToString();
         }
 
         private static string ExtractTextFromPdf(string filePath)
@@ -74,7 +241,7 @@ namespace BotRecognize.Controller
             var (invoiceNumber, invoiceDate) = ExtractInvoiceNumberAndDate(text);
             var amount = ExtractAmount(text);
             var recipient = ExtractRecipient(text);
-            var purpose = ExtractPurpose(text);
+            var purpose = ExtractPurpose(text, invoiceNumber, invoiceDate);
 
             return (invoiceNumber, invoiceDate, amount, recipient, purpose);
         }
@@ -226,10 +393,32 @@ namespace BotRecognize.Controller
             return match.Success ? $"{match.Groups[1].Value} {match.Groups[2].Value}" : null;
         }
 
-        private static string ExtractPurpose(string text)
+        private static string ExtractPurpose(string text, string invoiceNumber, DateTime invoiceDate)
         {
-            var match = Regex.Match(text, @"Назначение платежа:\s*(.+)");
-            return match.Success ? match.Groups[1].Value.Trim() : null;
+            // Паттерны для поиска назначения платежа
+            var patterns = new[]
+            {
+                @"ВАЖНО! В ЦЕЛЯХ ИСКЛЮЧЕНИЯ ОШИБОК ПРИ ПРОВЕДЕНИИ ОПЛАТ ПРОСИМ В ПЛАТЕЖНЫХ ПОРУЧЕНИЯХ В НАЗНАЧЕНИИ ПЛАТЕЖА УКАЗЫВАТЬ:\s*(.+)",
+                @"В НАЗНАЧЕНИИ ПЛАТЕЖА УКАЗЫВАТЬ:\s*(.+)",
+                @"Назначение платежа:\s*(.+)",
+                @"Основание платежа:\s*(.+)",
+                @"Комментарий:\s*(.+)",
+                @"Описание:\s*(.+)",
+                @"Примечание:\s*(.+)"
+            };
+
+            foreach (var pattern in patterns)
+            {
+                var match = Regex.Match(text, pattern, RegexOptions.IgnoreCase);
+                if (match.Success)
+                {
+                    // Возвращаем найденное назначение платежа
+                    return match.Groups[1].Value.Trim();
+                }
+            }
+
+            // Если назначение платежа не найдено, возвращаем текст по умолчанию
+            return $"Оплата счета №{invoiceNumber} от {invoiceDate.ToShortDateString()}";
         }
     }
 }
