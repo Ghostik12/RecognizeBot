@@ -28,7 +28,7 @@ namespace BotRecognize
         public static void ConfigureServices(IServiceCollection services)
         {
             // Регистрируем Telegram-бота
-            services.AddSingleton<ITelegramBotClient>(provider => new TelegramBotClient("7935930217:AAF_KST07z_gL35RnoNoSdC3lA6H366ST8s"));
+            services.AddSingleton<ITelegramBotClient>(provider => new TelegramBotClient(""));
 
             // Регистрируем основной сервис бота и фоновые задачи
             services.AddHostedService<Bot>();
